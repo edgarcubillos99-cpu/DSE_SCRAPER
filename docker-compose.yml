@@ -1,0 +1,17 @@
+services:
+  dse-scraper-api:
+    build: .
+    container_name: dse-scraper-api
+    ports:
+      - "${PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: ${PORT:-PORT}
+      DSE_USER: ${DSE_USER:-DSE_USER}
+      DSE_PASSWORD: ${DSE_PASSWORD:-DSE_PASSWORD}
+      DSE_LOGIN_URL: ${DSE_LOGIN_URL:-DSE_LOGIN_URL}
+      DSE_BASE_URL: ${DSE_BASE_URL:-DSE_BASE_URL}
+      WORKERS: ${WORKERS:-WORKERS}
+      REALTIME_TIMEOUT_SEC: ${REALTIME_TIMEOUT_SEC:-REALTIME_TIMEOUT_SEC}
+    restart: unless-stopped
