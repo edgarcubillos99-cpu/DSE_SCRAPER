@@ -24,10 +24,10 @@ type Generator struct {
 }
 
 type ScrapeResult struct {
-	Name          string `json:"name"`
-	EngineRunTime string `json:"engine_run_time"`
-	FuelLevel     string `json:"fuel_level"`
-	Error         string `json:"error,omitempty"`
+	Name          string  `json:"name"`
+	EngineRunTime string  `json:"engine_run_time"`
+	FuelLevel     float64 `json:"fuel_level"`
+	Error         string  `json:"error,omitempty"`
 }
 
 // Cliente global que mantendrá la sesión (las cookies)
@@ -163,11 +163,11 @@ func authenticate() error {
 
 	// 2. POST con los mismos campos que envía el formulario del navegador
 	formData := url.Values{
-		"login[_csrfID]":    {csrfID},
-		"login[_csrfKey]":   {csrfKey},
-		"login[username]":   {user},
-		"login[password]":   {password},
-		"login[btnLogin]":   {"Login"},
+		"login[_csrfID]":  {csrfID},
+		"login[_csrfKey]": {csrfKey},
+		"login[username]": {user},
+		"login[password]": {password},
+		"login[btnLogin]": {"Login"},
 	}
 
 	resp, err = client.PostForm(loginURL, formData)

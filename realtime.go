@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,8 +17,8 @@ import (
 )
 
 const (
-	feedSubscribe      = 1
-	feedData           = 2
+	feedSubscribe    = 1
+	feedData         = 2
 	moduleInstrument = 0x83
 
 	instrumentEngineRunTime   = 305
@@ -113,12 +114,9 @@ func instrumentValue(feed instrumentFeed) string {
 	return fmt.Sprintf("%.2f", feed.Value)
 }
 
-func fuelLevelValue(feed instrumentFeed) string {
-	return fmt.Sprintf("%.2f", feed.Value)
-}
-
 func isCompleteResult(res ScrapeResult) bool {
-	return res.EngineRunTime != "" && res.FuelLevel != ""
+	// Comparamos con -1.0 en lugar de ""
+	return res.EngineRunTime != "" && res.FuelLevel != -1.0
 }
 
 func fetchInstrumentsViaWebSocket(targets []moduleTarget, timeout time.Duration) (map[string]ScrapeResult, error) {
@@ -158,7 +156,8 @@ func fetchInstrumentsViaWebSocket(targets []moduleTarget, timeout time.Duration)
 		if _, ok := needed[key]; !ok {
 			needed[key] = &pending{needEngine: true, needFuel: true}
 		}
-		results[t.ModuleID] = ScrapeResult{Name: t.GeneratorName}
+		// Inicializamos FuelLevel en -1.0
+		results[t.ModuleID] = ScrapeResult{Name: t.GeneratorName, FuelLevel: -1.0}
 	}
 
 	deadline := time.Now().Add(timeout)
@@ -209,7 +208,8 @@ func fetchInstrumentsViaWebSocket(targets []moduleTarget, timeout time.Duration)
 						case instrumentEngineRunTime:
 							res.EngineRunTime = instrumentValue(feed)
 						case t.FuelDialID:
-							res.FuelLevel = fuelLevelValue(feed)
+							// Asignamos el valor como número flotante redondeado a 2 decimales
+							res.FuelLevel = math.Round(feed.Value*100) / 100
 						}
 					}
 					results[t.ModuleID] = res
@@ -227,7 +227,8 @@ func fetchInstrumentsViaWebSocket(targets []moduleTarget, timeout time.Duration)
 						if res.EngineRunTime != "" {
 							p.needEngine = false
 						}
-						if res.FuelLevel != "" {
+						// Cambiamos la validación a -1.0
+						if res.FuelLevel != -1.0 {
 							p.needFuel = false
 						}
 					}
