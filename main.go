@@ -134,8 +134,45 @@ func handleScrape(w http.ResponseWriter, r *http.Request) {
 	enc.Encode(finalData)
 }
 
-// authenticate obtiene los tokens CSRF del formulario y envía el login.
+func dseSiteURL() (*url.URL, error) {
+	base := os.Getenv("DSE_BASE_URL")
+	if base == "" {
+		base = os.Getenv("DSE_LOGIN_URL")
+	}
+	return url.Parse(base)
+}
+
+func clearSessionCookies() {
+	u, err := dseSiteURL()
+	if err != nil {
+		return
+	}
+	client.Jar.SetCookies(u, nil)
+}
+
+// isAuthenticated comprueba si las cookies actuales siguen siendo válidas.
+func isAuthenticated() bool {
+	baseURL := os.Getenv("DSE_BASE_URL")
+	if baseURL == "" {
+		return false
+	}
+	resp, err := client.Get(baseURL)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.Request == nil || resp.Request.URL == nil {
+		return false
+	}
+	return !strings.Contains(resp.Request.URL.String(), "login.php")
+}
+
+// authenticate reutiliza la sesión activa o obtiene tokens CSRF y envía el login.
 func authenticate() error {
+	if isAuthenticated() {
+		return nil
+	}
+
 	loginURL := os.Getenv("DSE_LOGIN_URL")
 	user := os.Getenv("DSE_USER")
 	password := os.Getenv("DSE_PASSWORD")
@@ -143,6 +180,9 @@ func authenticate() error {
 	if user == "" || password == "" {
 		return fmt.Errorf("DSE_USER o DSE_PASSWORD no están configurados en .env")
 	}
+
+	// Sin sesión válida: limpiar cookies para que login.php devuelva el formulario con CSRF
+	clearSessionCookies()
 
 	// 1. GET de la página de login para obtener cookies de sesión y tokens CSRF
 	resp, err := client.Get(loginURL)
@@ -158,7 +198,22 @@ func authenticate() error {
 	csrfID, _ := doc.Find(`input[name="login[_csrfID]"]`).Attr("value")
 	csrfKey, _ := doc.Find(`input[name="login[_csrfKey]"]`).Attr("value")
 	if csrfID == "" || csrfKey == "" {
-		return fmt.Errorf("no se encontraron tokens CSRF en la página de login")
+		// Reintento tras limpiar cookies (p. ej. sesión a medias)
+		clearSessionCookies()
+		resp, err = client.Get(loginURL)
+		if err != nil {
+			return fmt.Errorf("error al recargar la página de login: %v", err)
+		}
+		doc, err = goquery.NewDocumentFromReader(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return fmt.Errorf("error parseando la página de login: %v", err)
+		}
+		csrfID, _ = doc.Find(`input[name="login[_csrfID]"]`).Attr("value")
+		csrfKey, _ = doc.Find(`input[name="login[_csrfKey]"]`).Attr("value")
+		if csrfID == "" || csrfKey == "" {
+			return fmt.Errorf("no se encontraron tokens CSRF en la página de login")
+		}
 	}
 
 	// 2. POST con los mismos campos que envía el formulario del navegador
