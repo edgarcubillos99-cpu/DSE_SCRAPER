@@ -11,24 +11,27 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 const (
-	feedSubscribe    = 1
-	feedData         = 2
-	moduleInstrument = 0x83
+	feedSubscribe        = 1
+	feedData             = 2
+	moduleStateMachine   = 0x82
+	moduleInstrument     = 0x83
+	supervisorStateIndex = 3 // widgetStateMachine3 → "Supervisor State"
 
 	instrumentEngineRunTime   = 305
 	instrumentFuelDialDefault = 3 // widget dial "Fuel Level" (dial_textValue2 → ej. 77%)
 )
 
 type moduleTarget struct {
-	ModuleID      string // ID único del enlace en el dashboard (attr name)
-	GeneratorName string
-	GatewayUSBID  string
+	ModuleID       string // ID único del enlace en el dashboard (attr name)
+	GeneratorName  string
+	GatewayUSBID   string
 	ModuleUSBID   string
 	FuelDialID    int
 }
@@ -98,7 +101,8 @@ func buildFeedSubscription(targets []moduleTarget) map[string]any {
 		}
 		modules := gwEntry["modules"].(map[string]any)
 		modules[t.ModuleUSBID] = map[string]any{
-			strconv.Itoa(moduleInstrument): moduleInstrumentIDs(t),
+			strconv.Itoa(moduleInstrument):   moduleInstrumentIDs(t),
+			strconv.Itoa(moduleStateMachine): []int{supervisorStateIndex},
 		}
 	}
 
@@ -119,7 +123,151 @@ func isCompleteResult(res ScrapeResult) bool {
 	return res.EngineRunTime != "" && res.FuelLevel != -1.0
 }
 
-func fetchInstrumentsViaWebSocket(targets []moduleTarget, timeout time.Duration) (map[string]ScrapeResult, error) {
+type wsPending struct {
+	needEngine     bool
+	needFuel       bool
+	needSupervisor bool
+}
+
+type wsSession struct {
+	mu       sync.Mutex
+	targets  []moduleTarget
+	byModule map[string]moduleTarget
+	results  map[string]ScrapeResult
+	needed   map[string]*wsPending
+	emitted  map[string]bool
+	conn     *websocket.Conn
+}
+
+func (s *wsSession) addTarget(t moduleTarget) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.targets = append(s.targets, t)
+	s.byModule[t.ModuleID] = t
+	s.results[t.ModuleID] = ScrapeResult{Name: t.GeneratorName, FuelLevel: -1.0}
+
+	key := t.GatewayUSBID + "|" + t.ModuleUSBID
+	if _, ok := s.needed[key]; !ok {
+		s.needed[key] = &wsPending{needEngine: true, needFuel: true, needSupervisor: true}
+	}
+}
+
+func (s *wsSession) subscribe() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn == nil || len(s.targets) == 0 {
+		return nil
+	}
+	return s.conn.WriteJSON(buildFeedSubscription(s.targets))
+}
+
+func (s *wsSession) tryEmit(moduleID string, maps *mapHolder, out chan<- ScrapeResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.emitted[moduleID] {
+		return
+	}
+	res, ok := s.results[moduleID]
+	if !ok || !isCompleteResult(res) {
+		return
+	}
+	t := s.byModule[moduleID]
+	s.emitted[moduleID] = true
+
+	maps.applyCoords(t.GatewayUSBID, &res)
+	out <- res
+}
+
+func (s *wsSession) applyFeed(gateways map[string]struct {
+	Modules map[string]map[string]json.RawMessage `json:"modules"`
+}, maps *mapHolder, out chan<- ScrapeResult) {
+	instrumentKey := strconv.Itoa(moduleInstrument)
+	stateMachineKey := strconv.Itoa(moduleStateMachine)
+	supervisorKey := strconv.Itoa(supervisorStateIndex)
+
+	for gwID, gw := range gateways {
+		for modID, mod := range gw.Modules {
+			key := gwID + "|" + modID
+
+			s.mu.Lock()
+			var moduleIDs []string
+			for id, t := range s.byModule {
+				if t.GatewayUSBID == gwID && t.ModuleUSBID == modID {
+					moduleIDs = append(moduleIDs, id)
+				}
+			}
+			s.mu.Unlock()
+
+			if len(moduleIDs) == 0 {
+				continue
+			}
+
+			for _, moduleID := range moduleIDs {
+				s.mu.Lock()
+				t := s.byModule[moduleID]
+				res := s.results[moduleID]
+
+				if rawInstruments, ok := mod[instrumentKey]; ok {
+					var instruments map[string]instrumentFeed
+					if err := json.Unmarshal(rawInstruments, &instruments); err == nil {
+						for idStr, feed := range instruments {
+							id, _ := strconv.Atoi(idStr)
+							switch id {
+							case instrumentEngineRunTime:
+								res.EngineRunTime = instrumentValue(feed)
+							case t.FuelDialID:
+								res.FuelLevel = math.Round(feed.Value*100) / 100
+							}
+						}
+					}
+				}
+
+				if rawStates, ok := mod[stateMachineKey]; ok {
+					var states map[string]string
+					if err := json.Unmarshal(rawStates, &states); err == nil {
+						if state, ok := states[supervisorKey]; ok && state != "" && state != "#N/A#" {
+							res.SupervisorState = state
+						}
+					}
+				}
+
+				s.results[moduleID] = res
+
+				if p, ok := s.needed[key]; ok {
+					if res.EngineRunTime != "" {
+						p.needEngine = false
+					}
+					if res.FuelLevel != -1.0 {
+						p.needFuel = false
+					}
+					if res.SupervisorState != "" {
+						p.needSupervisor = false
+					}
+					if !p.needEngine && !p.needFuel && !p.needSupervisor {
+						delete(s.needed, key)
+					}
+				}
+				s.mu.Unlock()
+
+				s.tryEmit(moduleID, maps, out)
+			}
+		}
+	}
+}
+
+func (s *wsSession) pendingCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.needed)
+}
+
+// consumeInstrumentsWebSocket recibe targets por canal, abre WS al primer módulo
+// y publica cada generador completo en out en cuanto llegan los datos.
+func consumeInstrumentsWebSocket(targetsIn <-chan moduleTarget, out chan<- ScrapeResult, maps *mapHolder, timeout time.Duration) {
+	defer close(out)
+
 	wsURL := os.Getenv("DSE_REALTIME_URL")
 	if wsURL == "" {
 		wsURL = "wss://www.dsewebnet.com/user"
@@ -127,126 +275,173 @@ func fetchInstrumentsViaWebSocket(targets []moduleTarget, timeout time.Duration)
 
 	u, err := url.Parse("https://www.dsewebnet.com")
 	if err != nil {
-		return nil, err
+		log.Printf("WebSocket: %v\n", err)
+		return
 	}
 
-	hdr := http.Header{}
-	for _, c := range client.Jar.Cookies(u) {
-		hdr.Add("Cookie", c.Name+"="+c.Value)
+	session := &wsSession{
+		byModule: make(map[string]moduleTarget),
+		results:  make(map[string]ScrapeResult),
+		needed:   make(map[string]*wsPending),
+		emitted:  make(map[string]bool),
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, hdr)
-	if err != nil {
-		return nil, fmt.Errorf("error conectando WebSocket: %w", err)
-	}
-	defer conn.Close()
+	var (
+		connMu       sync.Mutex
+		resubMu      sync.Mutex
+		resubTimer   *time.Timer
+		targetsDone  = make(chan struct{})
+		readDone     = make(chan struct{})
+		deadline     = time.Now().Add(timeout)
+	)
 
-	if err := conn.WriteJSON(buildFeedSubscription(targets)); err != nil {
-		return nil, fmt.Errorf("error enviando suscripción: %w", err)
-	}
-
-	type pending struct {
-		needEngine bool
-		needFuel   bool
-	}
-	needed := make(map[string]*pending)
-	results := make(map[string]ScrapeResult)
-	for _, t := range targets {
-		key := t.GatewayUSBID + "|" + t.ModuleUSBID
-		if _, ok := needed[key]; !ok {
-			needed[key] = &pending{needEngine: true, needFuel: true}
+	scheduleSubscribe := func() {
+		resubMu.Lock()
+		defer resubMu.Unlock()
+		if resubTimer != nil {
+			resubTimer.Stop()
 		}
-		// Inicializamos FuelLevel en -1.0
-		results[t.ModuleID] = ScrapeResult{Name: t.GeneratorName, FuelLevel: -1.0}
+		resubTimer = time.AfterFunc(75*time.Millisecond, func() {
+			connMu.Lock()
+			defer connMu.Unlock()
+			if session.conn != nil {
+				if err := session.subscribe(); err != nil {
+					log.Printf("WebSocket: error re-suscribiendo: %v\n", err)
+				}
+			}
+		})
 	}
 
-	deadline := time.Now().Add(timeout)
-	_ = conn.SetReadDeadline(deadline)
-
-	for time.Now().Before(deadline) {
-		_, data, err := conn.ReadMessage()
+	dialWebSocket := func() error {
+		connMu.Lock()
+		defer connMu.Unlock()
+		if session.conn != nil {
+			return nil
+		}
+		hdr := http.Header{}
+		for _, c := range client.Jar.Cookies(u) {
+			hdr.Add("Cookie", c.Name+"="+c.Value)
+		}
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, hdr)
 		if err != nil {
-			break
+			return fmt.Errorf("error conectando WebSocket: %w", err)
 		}
+		session.conn = conn
+		return session.subscribe()
+	}
 
-		var msg map[string]json.RawMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
-			continue
-		}
+	go func() {
+		defer close(targetsDone)
+		for t := range targetsIn {
+			session.addTarget(t)
 
-		rawFeed, ok := msg[strconv.Itoa(feedData)]
-		if !ok {
-			continue
-		}
+			connMu.Lock()
+			needsDial := session.conn == nil
+			connMu.Unlock()
 
-		var gateways map[string]struct {
-			Modules map[string]map[string]map[string]instrumentFeed `json:"modules"`
-		}
-		if err := json.Unmarshal(rawFeed, &gateways); err != nil {
-			continue
-		}
-
-		feedKey := strconv.Itoa(moduleInstrument)
-		for gwID, gw := range gateways {
-			for modID, mod := range gw.Modules {
-				key := gwID + "|" + modID
-				instruments, ok := mod[feedKey]
-				if !ok {
-					continue
+			if needsDial {
+				if err := dialWebSocket(); err != nil {
+					log.Printf("WebSocket: %v\n", err)
+					return
 				}
-
-				var matched bool
-				for _, t := range targets {
-					if t.GatewayUSBID != gwID || t.ModuleUSBID != modID {
-						continue
-					}
-					matched = true
-					res := results[t.ModuleID]
-					for idStr, feed := range instruments {
-						id, _ := strconv.Atoi(idStr)
-						switch id {
-						case instrumentEngineRunTime:
-							res.EngineRunTime = instrumentValue(feed)
-						case t.FuelDialID:
-							// Asignamos el valor como número flotante redondeado a 2 decimales
-							res.FuelLevel = math.Round(feed.Value*100) / 100
-						}
-					}
-					results[t.ModuleID] = res
-				}
-				if !matched {
-					continue
-				}
-
-				if p, ok := needed[key]; ok {
-					for _, t := range targets {
-						if t.GatewayUSBID != gwID || t.ModuleUSBID != modID {
-							continue
-						}
-						res := results[t.ModuleID]
-						if res.EngineRunTime != "" {
-							p.needEngine = false
-						}
-						// Cambiamos la validación a -1.0
-						if res.FuelLevel != -1.0 {
-							p.needFuel = false
-						}
-					}
-					if !p.needEngine && !p.needFuel {
-						delete(needed, key)
-					}
-				}
+			} else {
+				scheduleSubscribe()
 			}
 		}
 
-		if len(needed) == 0 {
-			break
+		resubMu.Lock()
+		if resubTimer != nil {
+			resubTimer.Stop()
 		}
-	}
+		resubMu.Unlock()
 
-	if len(needed) > 0 {
-		log.Printf("WebSocket: timeout, faltan datos de %d módulo(s)\n", len(needed))
-	}
+		connMu.Lock()
+		if session.conn != nil {
+			_ = session.subscribe()
+		}
+		connMu.Unlock()
+	}()
 
-	return results, nil
+	go func() {
+		defer close(readDone)
+		for {
+			if time.Now().After(deadline) {
+				return
+			}
+
+			connMu.Lock()
+			conn := session.conn
+			connMu.Unlock()
+			if conn == nil {
+				select {
+				case <-targetsDone:
+					return
+				case <-time.After(50 * time.Millisecond):
+					continue
+				}
+			}
+
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				connMu.Lock()
+				if session.conn == conn {
+					_ = session.conn.Close()
+					session.conn = nil
+				}
+				connMu.Unlock()
+
+				if time.Now().After(deadline) {
+					return
+				}
+				select {
+				case <-targetsDone:
+					return
+				default:
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+			}
+
+			var msg map[string]json.RawMessage
+			if err := json.Unmarshal(data, &msg); err != nil {
+				continue
+			}
+
+			rawFeed, ok := msg[strconv.Itoa(feedData)]
+			if !ok {
+				continue
+			}
+
+			var gateways map[string]struct {
+				Modules map[string]map[string]json.RawMessage `json:"modules"`
+			}
+			if err := json.Unmarshal(rawFeed, &gateways); err != nil {
+				continue
+			}
+
+			session.applyFeed(gateways, maps, out)
+
+			if session.pendingCount() == 0 {
+				select {
+				case <-targetsDone:
+					return
+				default:
+				}
+			}
+		}
+	}()
+
+	<-targetsDone
+	<-readDone
+
+	connMu.Lock()
+	if session.conn != nil {
+		_ = session.conn.Close()
+	}
+	connMu.Unlock()
+
+	if n := session.pendingCount(); n > 0 {
+		log.Printf("WebSocket: timeout, faltan datos de %d módulo(s)\n", n)
+	}
 }

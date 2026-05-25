@@ -10,7 +10,7 @@ RUN apk add --no-cache ca-certificates git
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY main.go realtime.go ./
+COPY main.go realtime.go map.go scrape.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /dse-scraper-api .
 
 # Runtime

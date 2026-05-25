@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
@@ -11,7 +10,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -24,20 +22,22 @@ type Generator struct {
 }
 
 type ScrapeResult struct {
-	Name          string  `json:"name"`
-	EngineRunTime string  `json:"engine_run_time"`
-	FuelLevel     float64 `json:"fuel_level"`
-	Error         string  `json:"error,omitempty"`
+	Name           string   `json:"name"`
+	EngineRunTime  string   `json:"engine_run_time"`
+	FuelLevel      float64  `json:"fuel_level"`
+	SupervisorState string   `json:"supervisor_state,omitempty"`
+	Latitude       *float64 `json:"latitude,omitempty"`
+	Longitude      *float64 `json:"longitude,omitempty"`
+	Error          string   `json:"error,omitempty"`
 }
 
 // Cliente global que mantendrá la sesión (las cookies)
 var client *http.Client
 
 func main() {
-	// Cargar variables de entorno
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("Advertencia: No se encontró el archivo .env, usando variables del sistema si existen")
+	// Cargar .env local (en Docker Compose las variables llegan por env_file, sin archivo .env)
+	if err := godotenv.Load(); err != nil && os.Getenv("DSE_USER") == "" && os.Getenv("DSE_PASSWORD") == "" {
+		log.Println("Advertencia: no hay .env ni variables DSE_USER/DSE_PASSWORD en el entorno")
 	}
 
 	// Inicializar el gestor de cookies
@@ -46,9 +46,9 @@ func main() {
 		log.Fatal("Error creando cookie jar:", err)
 	}
 
-	// El cliente HTTP ahora guardará y enviará cookies automáticamente
 	client = &http.Client{
-		Jar: jar,
+		Jar:     jar,
+		Timeout: 30 * time.Second,
 	}
 
 	port := os.Getenv("PORT")
@@ -90,13 +90,6 @@ func handleScrape(w http.ResponseWriter, r *http.Request) {
 		numWorkers = 5
 	}
 
-	targets, _ := fetchModuleTargets(baseURL, generators, numWorkers)
-	if len(targets) == 0 {
-		log.Println("Error: no se pudo resolver ningún módulo con pestaña Engine")
-		http.Error(w, "Error al resolver módulos DSE", http.StatusInternalServerError)
-		return
-	}
-
 	wsTimeout := 45 * time.Second
 	if s := os.Getenv("REALTIME_TIMEOUT_SEC"); s != "" {
 		if sec, err := strconv.Atoi(s); err == nil && sec > 0 {
@@ -104,24 +97,11 @@ func handleScrape(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	instrumentData, err := fetchInstrumentsViaWebSocket(targets, wsTimeout)
-	if err != nil {
-		log.Printf("Error WebSocket: %v\n", err)
-		http.Error(w, "Error obteniendo datos en tiempo real", http.StatusInternalServerError)
+	finalData := runScrapePipeline(baseURL, generators, numWorkers, wsTimeout)
+	if len(finalData) == 0 {
+		log.Println("Error: no se obtuvieron datos completos de ningún generador")
+		http.Error(w, "Error al resolver módulos DSE", http.StatusInternalServerError)
 		return
-	}
-
-	var finalData []ScrapeResult
-	for _, gen := range generators {
-		res, ok := instrumentData[gen.ID]
-		if !ok {
-			continue
-		}
-		if !isCompleteResult(res) {
-			continue
-		}
-		res.Name = gen.Name
-		finalData = append(finalData, res)
 	}
 
 	// Justo antes de devolver el JSON:
@@ -269,63 +249,3 @@ func fetchGeneratorsList(baseURL string) ([]Generator, error) {
 	return generators, nil
 }
 
-func fetchModuleTargets(baseURL string, generators []Generator, numWorkers int) ([]moduleTarget, map[string]string) {
-	jobs := make(chan Generator, len(generators))
-	type targetResult struct {
-		target   moduleTarget
-		err      string
-		moduleID string
-	}
-	results := make(chan targetResult, len(generators))
-	var wg sync.WaitGroup
-
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for gen := range jobs {
-				targetURL := fmt.Sprintf("%s/module.php?id=%s&tab=3", baseURL, gen.ID)
-				resp, err := client.Get(targetURL)
-				if err != nil {
-					results <- targetResult{moduleID: gen.ID, err: "Error de conexión"}
-					continue
-				}
-				body, err := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if err != nil {
-					results <- targetResult{moduleID: gen.ID, err: "Error leyendo página"}
-					continue
-				}
-				t, err := parseModuleTargets(string(body), gen)
-				if err != nil {
-					results <- targetResult{moduleID: gen.ID, err: err.Error()}
-					continue
-				}
-				results <- targetResult{target: t}
-			}
-		}()
-	}
-
-	for _, gen := range generators {
-		jobs <- gen
-	}
-	close(jobs)
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var targets []moduleTarget
-	errors := make(map[string]string)
-	for res := range results {
-		if res.err != "" {
-			// Sin pestaña Engine u otro motivo: omitir silenciosamente del scrape
-			if res.err != "módulo sin pestaña Engine" {
-				errors[res.moduleID] = res.err
-			}
-			continue
-		}
-		targets = append(targets, res.target)
-	}
-	return targets, errors
-}
