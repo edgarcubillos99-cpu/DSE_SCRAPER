@@ -3,7 +3,7 @@ services:
     build: .
     container_name: dse-scraper-api
     ports:
-      - "${PORT:-8080}:8080"
+      - "${PORT}:${PORT}"
     env_file:
       - .env
     environment:
