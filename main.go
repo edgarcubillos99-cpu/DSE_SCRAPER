@@ -56,7 +56,8 @@ func main() {
 		port = "8080"
 	}
 
-	http.HandleFunc("/api/generators", handleScrape)
+	// Envolvemos handleScrape con el middleware basicAuth
+	http.HandleFunc("/api/generators", basicAuth(handleScrape))
 
 	fmt.Printf("Servidor iniciado en el puerto %s...\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
@@ -249,3 +250,32 @@ func fetchGeneratorsList(baseURL string) ([]Generator, error) {
 	return generators, nil
 }
 
+// basicAuth que protege un endpoint con usuario y contraseña
+func basicAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Leer credenciales esperadas desde el .env
+		expectedUser := os.Getenv("API_USER")
+		expectedPass := os.Getenv("API_PASSWORD")
+
+		// Por seguridad, si las variables no están configuradas, no permitimos el acceso
+		if expectedUser == "" || expectedPass == "" {
+			log.Println("Advertencia: API_USER o API_PASSWORD no están configurados en el entorno.")
+			http.Error(w, "Error interno del servidor: Credenciales de API no configuradas", http.StatusInternalServerError)
+			return
+		}
+
+		// Obtener las credenciales enviadas por el cliente en la petición
+		user, pass, ok := r.BasicAuth()
+
+		// Validar que se enviaron credenciales y que coinciden con las del .env
+		if !ok || user != expectedUser || pass != expectedPass {
+			// Si fallan, pedimos autenticación y devolvemos un 401 Unauthorized
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted API"`)
+			http.Error(w, "No autorizado", http.StatusUnauthorized)
+			return
+		}
+
+		// Si las credenciales son correctas, ejecutamos la función original (handleScrape)
+		next(w, r)
+	}
+}
